@@ -265,7 +265,7 @@ class batchPolyZonotope:
         
         else:
             return NotImplemented
-        
+    
     # def __len__(self):
     #     return self.Z.shape[0]
 
@@ -480,7 +480,7 @@ class batchPolyZonotope:
 
 
     def deleteZerosGenerators(self,eps=0):
-        expMat, G = removeRedundantExponentsBatch(expMat,G,self.batch_idx_all)
+        expMat, G = removeRedundantExponentsBatch(self.expMat,self.G,self.batch_idx_all)
         ind = torch.sum(expMat,1) == 0
         if torch.any(ind):
             c = self.c + torch.sum(G[ind],0)
