@@ -112,8 +112,6 @@ class polyZonotope:
         assert self.expMat.shape[0] == self.n_dep_gens, 'Invalid exponent matrix.'
         if zpi.__debug_extra__:
             assert torch.all(self.expMat >= 0), 'Invalid exponent matrix.'
-
-        assert self.expMat.shape[1] == self.dimension
     
     @property
     def id(self) -> np.ndarray:
@@ -152,7 +150,7 @@ class polyZonotope:
     
     def _compute_id_from_expmat(self):
         self._id = []
-        hashes = list(map(lambda x: hash(tuple(x)), self.expMat.tolist()))
+        hashes = list(map(lambda x: hash(tuple(x)), self.expMat.T.tolist()))
         self._id = np.array(hashes)
         return self._id
 
@@ -449,6 +447,26 @@ class polyZonotope:
         n_dep_gens = self.n_dep_gens + other.n_dep_gens
         return polyZonotope(Z, n_dep_gens, expMat, id).compress(2)
 
+    def lift_to_ndim(self, ndim: int) -> "polyZonotope":
+
+        assert self.dimension == 1, "Can only lift a 1D polyZonotope"
+        assert ndim >= 1, "ndim must be >= 1"
+
+        Z_blocks = []
+        expMat_blocks = []
+
+        for i in range(ndim):
+            Z_i = torch.zeros((self.Z.shape[0], ndim), dtype=self.dtype, device=self.device)
+            Z_i[:, i] = self.Z[:, 0]
+            Z_blocks.append(Z_i)
+
+            expMat_blocks.append(self.expMat.clone())
+
+        Z_lifted = torch.cat(Z_blocks, dim=0)
+        expMat_lifted = torch.cat(expMat_blocks, dim=0)
+
+        return polyZonotope(Z=Z_lifted, n_dep_gens=expMat_lifted.shape[0], expMat=expMat_lifted).compress(2)
+
     def to_zonotope(self):
         if self.n_dep_gens != 0:
             ind = torch.any(self.expMat % 2, 1)
@@ -653,7 +671,7 @@ class polyZonotope:
         ind = torch.sum(expMat, 0) == 0
         if torch.any(ind):
             expMat = expMat[:, ~ind]
-            id = id[:, ~ind]
+            id = id[~ind]
         return polyZonotope(torch.vstack((c, G, self.Grest)), G.shape[0], expMat, id, copy_Z=False)
 
     def project(self, dim=[0, 1]):
