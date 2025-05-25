@@ -619,44 +619,41 @@ class polyZonotope:
         slice_ids = slice_ids.to(dtype=torch.long, device=self.device).flatten()
         val_slc = val_slc.to(dtype=self.dtype, device=self.device).flatten()
 
-        # Sort self.id and get permutation to recover original order
-        id_sorted, sort_idx = torch.sort(torch.from_numpy(self.id))
-        expMat_sorted = self.expMat[:, sort_idx]
-
         # Build mask for which IDs to slice
         # This will give us a mask of shape [n_ids] indicating which expMat columns to slice
-        is_slice = (id_sorted[None, :] == slice_ids[:, None]).any(dim=0)
+        is_slice = (self.id[None, :] == slice_ids[:, None]).any(dim=0)
 
         if not torch.any(is_slice):
             return self  # Nothing to slice
 
         # Get values aligned to expMat columns to be sliced
-        matched_ids = id_sorted[is_slice]
+        matched_ids = torch.from_numpy(np.atleast_1d(self.id[torch.where(is_slice)]))
         val_slc_aligned = torch.zeros_like(matched_ids, dtype=self.dtype)
         for i, slice_id in enumerate(matched_ids):
             val_slc_aligned[i] = val_slc[(slice_ids == slice_id).nonzero(as_tuple=False)[0, 0]]
 
         # Compute new center offset by evaluating monomials
-        exponents = expMat_sorted[:, is_slice]
+        exponents = self.expMat[:, is_slice]
         coeffs = torch.prod(val_slc_aligned.unsqueeze(0) ** exponents, dim=1)
-        try:
-            offset = coeffs[is_slice] @ self.G[is_slice]
-        except:
-            breakpoint()
+        offset = coeffs @ self.G
+
         new_c = self.c.clone() + offset
 
         # Remove sliced columns
-        expMat_unsliced = expMat_sorted[:, ~is_slice]
-        id_unsliced = id_sorted[~is_slice]
+        expMat_unsliced = self.expMat[:, ~is_slice]
+        labels_rem = None if self.indet_labels is None else \
+            [l for (l, b) in zip(self.indet_labels, ~is_slice) if b]
 
         # Remove collapsed generators (i.e. all exponents zero)
         keep = torch.any(expMat_unsliced != 0, dim=1)
         new_G = self.G[keep]
         new_expMat = expMat_unsliced[keep]
+        if new_expMat.shape[1] == 0:
+            new_expMat = torch.eye(0).to(new_expMat)
 
         new_Z = torch.vstack((new_c, new_G, self.Grest))
-        return polyZonotope(new_Z, new_G.shape[0], new_expMat, id_unsliced.tolist()).compress(2)
-
+        return polyZonotope(new_Z, new_G.shape[0], new_expMat, indet_labels=labels_rem).compress(2)
+    
     def deleteZerosGenerators(self, eps=0):
         expMat, G = removeRedundantExponents(self.expMat, self.G)
         ind = torch.sum(expMat, 1) == 0
