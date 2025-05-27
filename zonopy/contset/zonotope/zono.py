@@ -415,7 +415,7 @@ class zonotope:
         V = V.unsqueeze(0)        
         return torch.cat([V[:,s] for s in K.simplices])
  
-    def plot(self, ax,facecolor='none',edgecolor='green',linewidth=.2,dim=[0,1]):
+    def plot(self, ax,facecolor='none',edgecolor='green',linewidth=.2,dim=[0,1], label=None, alpha=.4):
         '''
         plot 2 dimensional projection of a zonotope
         self: <zonotope>
@@ -434,7 +434,9 @@ class zonotope:
         z = self.project(dim)
         p = z.polygon().cpu()
 
-        return ax.add_patch(patches.Polygon(p,alpha=.5,edgecolor=edgecolor,facecolor=facecolor,linewidth=linewidth))
+        return ax.add_patch(patches.Polygon(p,edgecolor=edgecolor,
+                                            facecolor=facecolor,linewidth=linewidth,
+                                            label=label, alpha=alpha))
 
     def reduce(self,order,option='girard'):
         if option == 'girard':

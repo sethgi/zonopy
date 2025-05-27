@@ -82,29 +82,28 @@ def removeRedundantExponents(ExpMat,G):
 
 import numpy as np
 def mergeExpMatrix(id1, id2, expMat1, expMat2):
+    id1 = np.asarray(id1)
+    id2 = np.asarray(id2)
 
-    if len(id1) == len(id2) and all(id1==id2):
+    # Handle trivial case where both are equal
+    if id1.shape == id2.shape and np.all(id1 == id2) and expMat1.shape[1] == expMat2.shape[1]:
         return id1, expMat1, expMat2
-    
-    ind2 =np.zeros_like(id2)
-    Ind_rep = id2.reshape(-1,1) == id1
-    ind = np.any(Ind_rep,axis=1)
-    non_ind = ~ind
-    ind2[ind] = Ind_rep.nonzero()[1]
-    ind2[non_ind] = np.arange(non_ind.sum()) + len(id1)
-    id = np.hstack((id1,id2[non_ind]))
-    # preallocate
-    # expMat1_out = torch.zeros((len(expMat1), len(id)), dtype=torch.int64)
-    # expMat2_out = torch.zeros((len(expMat2), len(id)), dtype=torch.int64)
-    # # Store out
-    # expMat1_out[:,:len(id1)] = expMat1
-    # expMat2_out[:,ind2] = expMat2
-    # return id, expMat1_out, expMat2_out
-    expMat = torch.zeros((len(expMat1)+len(expMat2), len(id)), dtype=expMat1.dtype, device=expMat1.device)
-    expMat[:len(expMat1),:len(id1)] = expMat1
-    expMat[len(expMat1):,ind2] = expMat2
-    return id, expMat[:len(expMat1)], expMat[len(expMat1):]
 
+    # Unique set of all IDs
+    id_combined = np.unique(np.concatenate((id1, id2)))
+    id_map = {val: i for i, val in enumerate(id_combined)}
+
+    # Allocate new exp matrices
+    expMat1_out = torch.zeros((expMat1.shape[0], len(id_combined)), dtype=expMat1.dtype, device=expMat1.device)
+    expMat2_out = torch.zeros((expMat2.shape[0], len(id_combined)), dtype=expMat2.dtype, device=expMat2.device)
+
+    # Fill rows using mapping
+    for j, id_val in enumerate(id1):
+        expMat1_out[:, id_map[id_val]] = expMat1[:, j]
+    for j, id_val in enumerate(id2):
+        expMat2_out[:, id_map[id_val]] = expMat2[:, j]
+            
+    return id_combined, expMat1_out, expMat2_out
 
 def mergeExpMatrix_old(id1, id2, expMat1, expMat2):
     '''
