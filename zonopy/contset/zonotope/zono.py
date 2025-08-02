@@ -276,6 +276,8 @@ class zonotope:
         
         return <zonotope>
         '''
+        if isinstance(dim, int):
+            dim = [dim]
         Z = self.Z[:,dim]
         return zonotope(Z)
 
@@ -383,6 +385,7 @@ class zonotope:
         PA = torch.vstack((C,-C))
         Pb = torch.hstack((d+deltaD,-d+deltaD))
         return PA, Pb
+    
 
     def deleteZerosGenerators(self,eps=0):
         '''
@@ -481,3 +484,16 @@ class zonotope:
         return interval(leftLimit,rightLimit)
 
 
+    def l2_norm(self) -> interval:        
+        intv = self.to_interval()
+        lb = intv.inf
+        ub = intv.sup
+
+        # Compute lower and upper bounds of squared norm component-wise
+        lb_sq = torch.minimum(lb**2, ub**2)
+        ub_sq = torch.maximum(lb**2, ub**2)
+
+        lower_bound = torch.sqrt(torch.sum(lb_sq))
+        upper_bound = torch.sqrt(torch.sum(ub_sq))
+
+        return interval(lower_bound, upper_bound, device=self.device, dtype=self.dtype)

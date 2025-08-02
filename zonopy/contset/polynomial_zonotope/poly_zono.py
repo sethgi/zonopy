@@ -3,6 +3,7 @@ Define class for matrix polynomial zonotope
 Author: Yongseok Kwon
 Reference: CORA, Patrick Holme's implementation
 """
+from typing import Iterable
 from zonopy.contset.polynomial_zonotope.utils import removeRedundantExponents, mergeExpMatrix, pz_repr
 import zonopy as zp
 import torch
@@ -131,6 +132,9 @@ class polyZonotope:
     def expMat(self, new_val):
         self._expMat = new_val
         # self._compute_id_from_expmat()
+        
+    def l2_norm(self):
+        return self.to_zonotope().l2_norm()
 
     def compress(self, compression_level):
         # Remove zero generators
@@ -439,7 +443,7 @@ class polyZonotope:
             n_dg_red = 1
         return polyZonotope(ZRed, n_dg_red, self.expMat, self.id, copy_Z=False).compress(1)
 
-    def exactCartProd(self, other):
+    def exactCartProd(self, other, merge_ids = True):
         '''
         self: <polyZonotope>
         other: <polyZonotope>
@@ -447,9 +451,17 @@ class polyZonotope:
         '''
         if isinstance(other, polyZonotope):
             c = torch.hstack((self.c, other.c))
-            id, expMat1, expMat2 = mergeExpMatrix(self.id, other.id, self.expMat, other.expMat)
+            if merge_ids:
+                id, expMat1, expMat2 = mergeExpMatrix(self.id, other.id, self.expMat, other.expMat)
+                expMat = torch.vstack((expMat1, expMat2))
+
+            else:
+                id = np.concatenate((self.id, other.id + self.id.max() + 1))
+                expMat1 = self.expMat
+                expMat2 = other.expMat
+                expMat = torch.block_diag(expMat1, expMat2)
+
             G = torch.block_diag(self.G, other.G)
-            expMat = torch.vstack((expMat1, expMat2))
             Grest = torch.block_diag(self.Grest, other.Grest)
         Z = torch.vstack((c, G, Grest))
         n_dep_gens = self.n_dep_gens + other.n_dep_gens
@@ -678,6 +690,8 @@ class polyZonotope:
         return polyZonotope(torch.vstack((c, G, self.Grest)), G.shape[0], expMat, id, copy_Z=False)
 
     def project(self, dim=[0, 1]):
+        if isinstance(dim, int):
+            dim = [dim]
         return polyZonotope(self.Z[:, dim], self.n_dep_gens, self.expMat, self.id, copy_Z=False).compress(1)
     '''
     def plot(self,dim=[0,1]):
@@ -708,3 +722,57 @@ class polyZonotope:
         expMat = torch.empty((0, 0), dtype=torch.int64, device=device)
         id = np.empty(0, dtype=np.int64)
         return zp.polyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
+
+    def cross(
+        self,
+        other: "polyZonotope",
+        reduce_order: int = None,
+        reduce_option: str = "girard",
+        reduce_indep_order: int = None
+    ) -> "polyZonotope":
+        """
+        Compute the cross product of two 3D polyZonotopes, with optional reduction.
+
+        Args:
+            other (polyZonotope): Another 3D polyZonotope.
+            reduce_order (float, optional): Order for dependent generator reduction.
+            reduce_option (str, optional): Reduction method, e.g., 'girard'.
+            reduce_indep_order (float, optional): Order for independent generator reduction.
+
+        Returns:
+            polyZonotope: Resulting 3D polyZonotope.
+        """
+        def _validate_and_split(arg):
+            if isinstance(arg, polyZonotope):
+                assert arg.dimension == 3
+                return arg.project(0), arg.project(1), arg.project(2)
+            elif isinstance(arg, torch.Tensor):
+                assert arg.numel() == 3
+                return arg.flatten()
+        
+        a0, a1, a2 = _validate_and_split(self)
+        b0, b1, b2 = _validate_and_split(other)
+        
+        # Compute vector components of the cross product
+        s0 = a1 * b2 - a2 * b1
+        s1 = a2 * b0 - a0 * b2
+        s2 = a0 * b1 - a1 * b0
+
+        # Stack into full 3D vector via cartesian product
+        pz_out = polyZonotope.direct_product(s0, s1, s2)
+
+        # Optional generator reduction
+        if reduce_order is not None:
+            pz_out = pz_out.reduce(order=reduce_order, option=reduce_option)
+
+        if reduce_indep_order is not None:
+            pz_out = pz_out.reduce_indep(order=reduce_indep_order, option=reduce_option)
+
+        return pz_out
+    
+    @staticmethod
+    def direct_product(*pzs: "zp.polyZonotope") -> "polyZonotope":
+        output = pzs[0]
+        for pz in pzs[1:]:
+            output = output.exactCartProd(pz, False)
+        return output
