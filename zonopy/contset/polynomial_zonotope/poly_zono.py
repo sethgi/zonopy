@@ -7,7 +7,6 @@ from typing import Iterable
 from zonopy.contset.polynomial_zonotope.utils import removeRedundantExponents, mergeExpMatrix, pz_repr
 import zonopy as zp
 import torch
-import numpy as np
 from ..gen_ops import (
     _add_genpz_impl,
     _add_genzono_num_impl,
@@ -50,7 +49,7 @@ class polyZonotope:
     * :math:`p` is the number of indeterminants.
     """
 
-    def __init__(self, Z, n_dep_gens=0, expMat=None, id=None, copy_Z=True, dtype=None, device=None):
+    def __init__(self, Z, n_dep_gens=0, expMat=None, ids=None, copy_Z=True, dtype=None, device=None):
         r''' Initialize the polynomial zonotope
 
         Args:
@@ -74,12 +73,12 @@ class polyZonotope:
             dtype = torch.get_default_dtype()
         Z = torch.as_tensor(Z, dtype=dtype, device=device)
         
-        self._id = id
+        self._id = ids
 
         # Make an expMat and id if not given
-        if expMat is None and id is None:
+        if expMat is None and ids is None:
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device) # if G is EMPTY_TENSOR, it will be EMPTY_TENSOR, size = (0,0)Z
-            self.id = np.arange(self.expMat.shape[1],dtype=int)
+            self.id = torch.arange(self.expMat.shape[1],dtype=torch.int64, device=Z.device)
             
         # Otherwise make sure expMat is right
         elif expMat is not None:
@@ -89,14 +88,18 @@ class polyZonotope:
             
             self.expMat = expMat
             # Make sure ID is right
-            if id is not None:
-                self.id = np.asarray(id, dtype=int).flatten()
+            if ids is not None:
+                self.id = torch.as_tensor(ids, dtype=torch.int64, device=device).flatten()
             else:
-                self.id = np.arange(self.expMat.shape[1],dtype=int)
+                self.id = torch.arange(self.expMat.shape[1],dtype=torch.int64, device=Z.device)
         
         # Otherwise ID is given, but not the expMat, so make identity
         else:
-            self.id = np.array(id, dtype=int).flatten()
+            if isinstance(ids, torch.Tensor):
+                self.id = ids.clone().detach()
+            else:
+                self.id = torch.tensor(ids, dtype=torch.int).flatten()
+            
             assert len(self.id) == n_dep_gens, 'Number of dependent generators must match number of id\'s!'
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device)
 
@@ -111,18 +114,21 @@ class polyZonotope:
         
         self._validate()
         
+        assert self.id.device == self.Z.device
+        
+    @property
+    def id(self) -> torch.Tensor:
+        return self._id
+    
+    @id.setter
+    def id(self, val: torch.Tensor):
+        self._id = val
+        
     def _validate(self):
         assert self.expMat.shape[0] == self.n_dep_gens, 'Invalid exponent matrix.'
         if zpi.__debug_extra__:
             assert torch.all(self.expMat >= 0), 'Invalid exponent matrix.'
-    
-    @property
-    def id(self) -> np.ndarray:
-        return self._id
-    
-    @id.setter
-    def id(self, new_val):
-        self._id = new_val
+
 
     @property
     def expMat(self) -> torch.Tensor:
@@ -133,8 +139,149 @@ class polyZonotope:
         self._expMat = new_val
         # self._compute_id_from_expmat()
         
-    def l2_norm(self):
-        return self.to_zonotope().l2_norm()
+    def norm(self, ord=2, dims=None, inv=False):
+        """
+        Sound polyZonotope enclosure of ||x||_p for x in Z (or its reciprocal).
+        Keeps dependent structure via a linear (supporting) term and adds one
+        independent "radius" generator so that the interval endpoints match the
+        sharp triangle-inequality bounds.
+
+        Args:
+            ord: p in ||.||_p (float/int as in torch.linalg.vector_norm).
+            dims: int or iterable of indices to project before taking the norm.
+            inv: if True, return 1/||.||_p as a 1D zonotope interval (requires
+                the lower bound > 0).
+
+        Returns:
+            If inv is False:
+                polyZonotope of shape (1 + n_dep_gens' + n_indep_gens' + 1, 1)
+            If inv is True:
+                zonotope (1D interval) encoded by a 2x1 tensor [center; radius].
+        """
+        import torch
+        import zonopy as zp
+
+        Z = self.project(dims) if dims is not None else self
+
+        # Shapes (non-batch):
+        # c:            (d,)
+        # Gd = Z.G:     (N_dep, d)   (may be empty)
+        # Gi = Z.Grest: (N_ind, d)   (may be empty)
+        c  = Z.c
+        Gd = Z.G
+        Gi = Z.Grest
+
+        p = ord
+        eps = torch.finfo(c.dtype).eps
+
+        # Center p-norm and triangle-inequality radius r = sum ||gens||_p
+        c_norm = torch.linalg.vector_norm(c, ord=p, dim=-1)                          # ()
+        r_dep  = torch.linalg.vector_norm(Gd, ord=p, dim=-1).sum() if Gd.numel() else torch.zeros((), dtype=c.dtype, device=c.device)
+        r_ind  = torch.linalg.vector_norm(Gi, ord=p, dim=-1).sum() if Gi.numel() else torch.zeros((), dtype=c.dtype, device=c.device)
+        r = r_dep + r_ind
+
+        # Build (sub)gradient at c to preserve dependent structure
+        if p == 2:
+            denom = torch.clamp(c_norm, min=eps)
+            grad = c / denom                                                        # (d,)
+        elif isinstance(p, (int, float)) and p > 1:
+            denom = torch.clamp(c_norm, min=eps) ** (p - 1)
+            grad = torch.sign(c) * (torch.abs(c) ** (p - 1)) / denom                # (d,)
+        elif p == 1:
+            grad = torch.sign(c)                                                    # (d,)
+        else:
+            # Fallback for unsupported/other ord (incl. inf):
+            # Return tight interval as a scalar PZ with one independent gen.
+            new_c = c_norm                                                          # ()
+            extra = r                                                               # ()
+            total_gens = 1 + 0 + 1                                                  # center + (no dep) + 1 indep
+            Zs = torch.zeros((total_gens, 1), dtype=c.dtype, device=c.device)
+            Zs[0, 0] = new_c
+            Zs[1, 0] = extra
+            out = type(self)(
+                Zs,
+                n_dep_gens=0,
+                expMat=torch.zeros((0, 0), dtype=torch.long, device=c.device),
+                id=torch.empty(0, dtype=torch.int64, device=c.device),
+                copy_Z=False,
+            )
+            if inv:
+                l = torch.clamp(new_c - extra, min=0.0)
+                u = new_c + extra
+                if (l <= 0).item():
+                    raise ValueError("Reciprocal norm undefined: interval touches zero.")
+                inv_low  = 1.0 / u
+                inv_high = 1.0 / l
+                center = 0.5 * (inv_low + inv_high)
+                rad    = 0.5 * (inv_high - inv_low)
+                Z1 = torch.stack((center, rad)).reshape(2, 1)                       # (2,1)
+                return zp.zonotope(Z1)
+            return out.compress(1)
+
+        # Near-zero center: gradient becomes uninformative
+        near_zero = (c_norm <= eps)
+
+        # Dependent and independent scalar generators via the supporting plane
+        if Gd.numel():
+            # s_dep_i = grad · g_i
+            s_dep = (Gd @ grad)                                                     # (N_dep,)
+        else:
+            s_dep = torch.zeros((0,), dtype=c.dtype, device=c.device)
+
+        if Gi.numel():
+            # t_ind_j = grad · grest_j
+            t_ind = (Gi @ grad)                                                     # (N_ind,)
+        else:
+            t_ind = torch.zeros((0,), dtype=c.dtype, device=c.device)
+
+        # Add one extra independent "radius" generator to make endpoints tight
+        sums  = s_dep.abs().sum() + t_ind.abs().sum()                               # ()
+        extra = torch.clamp(r - sums, min=0.0)                                      # ()
+
+        # If center is (near) zero, drop linear structure and just use interval radius r
+        if near_zero:
+            s_dep = torch.zeros_like(s_dep)
+            t_ind = torch.zeros_like(t_ind)
+            extra = r
+
+        # Assemble scalar PZ:
+        # rows: [center; s_dep (N_dep); t_ind (N_ind); extra]
+        n_dep = Z.n_dep_gens
+        n_ind = Z.n_indep_gens
+        total_gens = 1 + n_dep + n_ind + 1
+        Zs = torch.zeros((total_gens, 1), dtype=c.dtype, device=c.device)
+
+        # center
+        Zs[0, 0] = c_norm
+        # keep SAME exponent structure/id mapping for dependent part
+        if n_dep:
+            Zs[1:1+n_dep, 0] = s_dep
+        if n_ind:
+            Zs[1+n_dep:1+n_dep+n_ind, 0] = t_ind
+        # extra independent radius generator
+        Zs[1+n_dep+n_ind, 0] = extra
+
+        out = type(self)(
+            Zs,
+            n_dep_gens=n_dep,
+            expMat=Z.expMat,
+            id=Z.id,
+            copy_Z=False
+        ).compress(1)
+
+        if inv:
+            # tight scalar interval from triangle inequality
+            l = torch.clamp(c_norm - r, min=0.0)
+            u = c_norm + r
+            if (l <= 0).item():
+                raise ValueError("Reciprocal norm undefined: interval touches zero.")
+            inv_low  = 1.0 / u
+            inv_high = 1.0 / l
+            center = 0.5 * (inv_low + inv_high)
+            rad    = 0.5 * (inv_high - inv_low)
+            Z1 = torch.stack((center, rad)).reshape(2, 1)                           # (2,1)
+            return zp.zonotope(Z1)
+
 
     def compress(self, compression_level):
         # Remove zero generators
@@ -158,17 +305,12 @@ class polyZonotope:
         # For chaining
         return self
     
-    # def _compute_id_from_expmat(self):
-    #     self._id = []
-    #     hashes = list(map(lambda x: hash(tuple(x)), self.expMat.T.tolist()))
-    #     self._id = np.array(hashes, dtype=np.long)
-    #     return self._id
 
     @property
     def itype(self):
         '''
         The data type of a polynomial zonotope exponent matrix
-        return torch.short, torch.int, torch.long
+        return torch.short, torch.int64, torch.long
         '''
         return self.expMat.dtype
 
@@ -230,23 +372,21 @@ class polyZonotope:
     @property
     def input_pairs(self):
         id_sorted, order = torch.sort(self.id)
-        order = np.argsort(self.id)
+        order = torch.argsort(self.id)
         expMat_sorted = self.expMat[:, order]
-        # return self.Z, self.n_dep_gens, expMat_sorted, id_sorted
         return self.Z, self.n_dep_gens, expMat_sorted, self.id[order]
 
     def to(self, dtype=None, itype=None, device=None):
         Z = self.Z.to(dtype=dtype, device=device, non_blocking=True)
         expMat = self.expMat.to(dtype=itype, device=device, non_blocking=True)
-        id = self.id.to(device=device)
-        return polyZonotope(Z, self.n_dep_gens, expMat, id, copy_Z=False)
+        return polyZonotope(Z, self.n_dep_gens, expMat, self.id, copy_Z=False, device=device)
 
     def clone(self):
         return polyZonotope(
             Z=torch.clone(self.Z),
             n_dep_gens=self.n_dep_gens,
             expMat=self.expMat.clone(),
-            id=np.copy(self.id),
+            ids=torch.clone(self.id),
             copy_Z=False  # already cloned above
         )
         
@@ -260,7 +400,7 @@ class polyZonotope:
         if self.expMat.numel() == 0:
             expMat_print = torch.tensor([])
         else:
-            expMat_print = self.expMat[:, np.argsort(self.id)]
+            expMat_print = self.expMat[:, torch.argsort(self.id)]
 
         pz_str = f"""center: \n{self.c.to(dtype=torch.float)} \n\nnumber of dependent generators: {self.G.shape[-1]} 
             \ndependent generators: \n{self.G.to(dtype=torch.float)}  \n\nexponent matrix: \n {expMat_print.to(dtype=torch.long)}
@@ -403,7 +543,7 @@ class polyZonotope:
             n_dg_rem = self.n_dep_gens
             expMatRem = self.expMat
         # remove all exponent vector dimensions that have no entries
-        ind = (torch.sum(expMatRem, 0) > 0).cpu().numpy()
+        ind = (torch.sum(expMatRem, 0) > 0)
         # ind = temp.nonzero().reshape(-1)
         expMatRem = expMatRem[:, ind]
         idRem = self.id[ind]
@@ -456,7 +596,7 @@ class polyZonotope:
                 expMat = torch.vstack((expMat1, expMat2))
 
             else:
-                id = np.concatenate((self.id, other.id + self.id.max() + 1))
+                id = torch.concatenate((self.id, other.id + self.id.max() + 1))
                 expMat1 = self.expMat
                 expMat2 = other.expMat
                 expMat = torch.block_diag(expMat1, expMat2)
@@ -503,108 +643,106 @@ class polyZonotope:
         else:
             assert False, 'Not implemented'
 
-    # TODO Inspect for speedup?
-    def slice_dep_old(self, id_slc, val_slc):
-        '''
-        Slice polynomial zonotpe in depdent generators
-        id_slc: id to slice
-        val_slc: indeterminant to slice
-        '''
-        if isinstance(id_slc, (int, list)):
-            if isinstance(id_slc, int):
-                id_slc = [id_slc]
-            # id_slc = torch.tensor(id_slc,dtype=self.dtype,device=self.device)
-            id_slc = np.array(id_slc, dtype=int)
-        if isinstance(val_slc, (int, float, list)):
-            if isinstance(val_slc, (int, float)):
-                val_slc = [val_slc]
-            val_slc = torch.tensor(val_slc, dtype=self.dtype, device=self.device)
-
-        if any(abs(val_slc) > 1):
-            import pdb
-            pdb.set_trace()
-        # assert all(val_slc<=1) and all(val_slc>=-1), 'Indereminant should be in [-1,1].'
-
-        id_slc, val_slc = id_slc.reshape(-1, 1), val_slc.reshape(1, -1)
-        order = np.argsort(id_slc.reshape(-1))
-        id_slc, val_slc = id_slc[order], val_slc[:, order]
-        ind = np.any(self.id == id_slc, axis=0)  # corresponding id for self.id
-        ind2 = np.any(self.id == id_slc, axis=1)  # corresponding id for id_slc
-        # assert ind.numel()==len(id_slc), 'Some specidied IDs do not exist!'
-        if ind.shape[0] != 0:
-            G = self.G * torch.prod(val_slc[:, ind2]**self.expMat[:, ind], dim=1)
-            expMat = self.expMat[:, ~ind]
-            id = self.id[:, ~ind]
-        else:
-            G = self.G
-            expMat = self.expMat
-            id = self.id
-        # expMat, G = removeRedundantExponents(expMat,G)
-        ind = torch.sum(expMat, 1) == 0
-        if torch.any(ind):
-            c = self.c + torch.sum(G[ind], 0)
-            G = G[~ind]
-            expMat = expMat[~ind]
-        else:
-            c = self.c
-        '''
-        id = self.id
-        ind = torch.sum(expMat,0) == 0
-        if torch.any(ind):
-            expMat = expMat[:,~ind]
-            id = id[:,~ind]
-        '''
-
-        breakpoint()
-        n_dep_gens = self.n_dep_gens - ind.sum()
-
-        if G.shape[0] == 0 and self.Grest.shape[0] == 0:
-            return polyZonotope(c, 0, expMat, id).compress(2)
-        else:
-            return polyZonotope(torch.vstack((c, G, self.Grest)), G.shape[0], expMat, id).compress(2)
-
-    def select_dim(self, dim):
-        Z = self.Z[:, dim:dim+1]
-        e = self.expMat[:, dim:dim+1]
-        return polyZonotope(Z, n_dep_gens=e.shape[0], id=self.id[dim:dim+1], expMat=e).compress(2)
 
     def center_slice_all_dep(self, val_slc):
-        # get all values in order
-        val_slc = val_slc[..., None, self.id]  # Batch dims, ..., 1, n_ids
-        # Exponentiate by exponent matrix, reduce the product for each term, then multiply by each dep gen
-        # offset = torch.prod(val_slc**self.expMat, dim=-1).unsqueeze(-2)@self.G
-        # In this case, torch einsum accomplishes the above with better accuracy and arbitrary dimensions
-        alpha_coeffs = torch.prod(val_slc**self.expMat, dim=-1)
-        offset = torch.einsum('...g,...gd->...d',
-                              alpha_coeffs,
-                              self.G)  # b1, b2,..., dim
+        # Ensure dtype/device
+        if not isinstance(val_slc, torch.Tensor):
+            val_slc = torch.as_tensor(val_slc, dtype=self.dtype, device=self.device)
+        else:
+            val_slc = val_slc.to(dtype=self.dtype, device=self.device)
+
+        device = self.device
+        exp_dtype = self.expMat.dtype
+
+        tgt_ids = torch.as_tensor(self.id, device=device, dtype=torch.long)  # (n_ids,)
+        n_ids = tgt_ids.numel()
+        src_width = val_slc.shape[-1]
+
+        # Compile-safe alignment:
+        # If already compact/aligned (K == n_ids): identity gather.
+        # Otherwise treat val_slc as dense-by-ID and gather by raw IDs with masking.
+        if src_width == n_ids:
+            gather_idx = torch.arange(n_ids, device=device)
+            gather_idx = gather_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx)  # (..., n_ids)
+        else:
+            idx = tgt_ids
+            mask = (idx >= 0) & (idx < src_width)
+            safe_idx = idx.clamp_min(0).clamp_max(src_width - 1)
+            gather_idx = safe_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx) * mask.to(val_slc.dtype)
+
+        # [..., 1, n_ids]
+        vals = vals[..., None, :].to(exp_dtype)
+
+        # alpha: (..., n_dep_gens)
+        alpha_coeffs = torch.prod(vals ** self.expMat, dim=-1)
+
+        # offset: (..., dim)
+        offset = torch.einsum("...g,...gd->...d", alpha_coeffs, self.G)
         return self.c + offset
 
+
     def grad_center_slice_all_dep(self, val_slc):
-        # prepare output
-        grad = torch.zeros((self.dimension, val_slc.shape[-1]), dtype=self.dtype, device=self.device)
-        n_ids = len(self.id)
+        # Ensure dtype/device
+        if not isinstance(val_slc, torch.Tensor):
+            val_slc = torch.as_tensor(val_slc, dtype=self.dtype, device=self.device)
+        else:
+            val_slc = val_slc.to(dtype=self.dtype, device=self.device)
 
-        # get all values in order
-        val_slc = val_slc[..., None, None, self.id]  # Batch dims, ..., 1, 1, n_ids
-        # a tensor of reduced order expMat for each column, n_ids,  n_dep_gens, n_ids
-        expMat_red = self.expMat.expand(n_ids, -1, -1) - torch.eye(n_ids,
-                                                                   dtype=self.expMat.dtype, device=self.device).unsqueeze(-2)
-        # grad[..., self.id] = ((self.expMat.T*torch.prod(val_slc**expMat_red,dim=-1).nan_to_num())@self.G).transpose(-1,-2) # b1, b2,..., dim, n_ids
-        # In this case, torch einsum accomplishes the above with better accuracy and arbitrary dimensions
-        alpha_coeffs = self.expMat.T * torch.prod(val_slc**expMat_red, dim=-1).nan_to_num()
-        # grad[..., self.id] = torch.einsum('...ig,...gd->...di',
-        #                                   alpha_coeffs,
-        #                                   self.G) # b1, b2,..., dim, n_ids
-        # Actually, in this case, manually writing it is faster
-        grad[..., self.id] = (alpha_coeffs @ self.G).transpose(-1, -2)
-        return grad
+        device = self.device
+        exp_dtype = self.expMat.dtype
 
+        tgt_ids = torch.as_tensor(self.id, device=device, dtype=torch.long)  # (n_ids,)
+        n_ids = tgt_ids.numel()
+        src_width = val_slc.shape[-1]
+
+        # Align inputs to target id order
+        if src_width == n_ids:
+            gather_idx = torch.arange(n_ids, device=device)
+            gather_idx = gather_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx)  # (..., n_ids)
+        else:
+            idx = tgt_ids
+            mask = (idx >= 0) & (idx < src_width)
+            safe_idx = idx.clamp_min(0).clamp_max(src_width - 1)
+            gather_idx = safe_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx) * mask.to(val_slc.dtype)
+
+        vals = vals.to(exp_dtype)
+
+        # expMat_red: (n_ids, n_dep_gens, n_ids)
+        eye = torch.eye(n_ids, dtype=exp_dtype, device=device)
+        expMat_red = self.expMat.unsqueeze(0) - eye.unsqueeze(1)
+
+        # (..., 1, 1, n_ids)
+        v_pow = vals[..., None, None, :]
+
+        # alpha per id: (..., n_ids, n_dep_gens)
+        alpha_coeffs = torch.prod((v_pow ** expMat_red).nan_to_num(), dim=-1)
+        alpha_coeffs = alpha_coeffs * self.expMat.transpose(-1, -2)
+
+        # grad in target-id space: (..., n_ids, dim) -> (..., dim, n_ids)
+        grad_tgt = torch.matmul(alpha_coeffs, self.G).transpose(-1, -2)
+
+        # If source width equals n_ids, we are done; else place into dense ID domain
+        if src_width == n_ids:
+            return grad_tgt
+        else:
+            # Build placement matrix P: (n_ids, src_width) with one-hot rows at raw IDs
+            safe_idx = tgt_ids.clamp_min(0).clamp_max(src_width - 1)
+            P = torch.nn.functional.one_hot(safe_idx, num_classes=src_width).to(grad_tgt.dtype)  # (n_ids, src_width)
+            mask = ((tgt_ids >= 0) & (tgt_ids < src_width)).to(grad_tgt.dtype).unsqueeze(-1)     # (n_ids, 1)
+            P = P * mask
+            # Place: (..., dim, n_ids) @ (n_ids, src_width) -> (..., dim, src_width)
+            grad_full = torch.matmul(grad_tgt, P)
+            return grad_full
+        
     # TODO Unverified since update
     def hess_center_slice_all_dep(self, val_slc):
         n_ids = self.id.shape[0]
         val_slc = val_slc[:n_ids]
-        expMat = self.expMat[:, np.argsort(self.id)]
+        expMat = self.expMat[:, torch.argsort(self.id)]
         # a tensor of reduced order expMat for each column
         expMat_red = expMat.unsqueeze(0).repeat(n_ids, 1, 1) - torch.eye(n_ids, dtype=int).unsqueeze(-2)
         expMat_twice_red = expMat.reshape((1, 1) + expMat.shape).repeat(n_ids, n_ids, 1, 1) - torch.eye(
@@ -647,7 +785,8 @@ class polyZonotope:
             return self  # Nothing to slice
 
         # Get values aligned to expMat columns to be sliced
-        matched_ids = torch.from_numpy(np.atleast_1d(self.id[torch.where(is_slice)]))
+        idx_cols = torch.nonzero(is_slice, as_tuple=False).squeeze(1)
+        matched_ids = matched_ids = self.id[idx_cols]
         val_slc_aligned = torch.zeros_like(matched_ids, dtype=self.dtype)
         for i, slice_id in enumerate(matched_ids):
             val_slc_aligned[i] = val_slc[(slice_ids == slice_id).nonzero(as_tuple=False)[0, 0]]
@@ -713,15 +852,15 @@ class polyZonotope:
     def zeros(dims, dtype=None, device=None):
         Z = torch.zeros((1, dims), dtype=dtype, device=device)
         expMat = torch.empty((0, 0), dtype=torch.int64, device=device)
-        id = np.empty(0, dtype=np.int64)
-        return zp.polyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
+        id = torch.empty(0, dtype=torch.int64, device=Z.device)
+        return zp.polyZonotope(Z, 0, expMat=expMat, ids=id, copy_Z=False)
 
     @staticmethod
     def ones(dims, dtype=None, device=None):
         Z = torch.ones((1, dims), dtype=dtype, device=device)
         expMat = torch.empty((0, 0), dtype=torch.int64, device=device)
-        id = np.empty(0, dtype=np.int64)
-        return zp.polyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
+        id = torch.empty(0, dtype=torch.int64, device=Z.device)
+        return zp.polyZonotope(Z, 0, expMat=expMat, ids=id, copy_Z=False)
 
     def cross(
         self,

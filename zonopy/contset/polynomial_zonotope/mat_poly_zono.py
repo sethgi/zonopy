@@ -6,7 +6,6 @@ Reference: Patrick Holme's implementation
 from zonopy.contset.polynomial_zonotope.utils import removeRedundantExponents
 import zonopy as zp
 import torch
-import numpy as np
 import zonopy.internal as zpi
 from ..gen_ops import (
     _matmul_genmpz_impl,
@@ -47,7 +46,7 @@ class matPolyZonotope():
             Z (torch.Tensor): The center and generator tensor of the matrix polynomial zonotope :math:`\mathbf{Z} = [C, \mathbf{G}_{(1)}, \ldots, \mathbf{G}_{(N)}, \mathbf{G}_{rest(1)}, \ldots, \mathbf{G}_{rest(M)}]`
             n_dep_gens (int, optional): The number of dependent generators. Default: 0
             expMat (torch.Tensor, optional): The exponent matrix. Default: None
-            id (np.ndarray, optional): The id array. Default: None
+            id (torch.Tensor, optional): The id array. Default: None
             copy_Z (bool, optional): If ``True``, it will copy the input Z. Default: ``True``
             dtype (torch.dtype, optional): The data type of the matrix polynomial zonotope. If ``None``, it will be inferred. Default: ``None``
             device (torch.device, optional): The device of the matrix polynomial zonotope. If ``None``, it will be inferred. Default: ``None``
@@ -67,7 +66,7 @@ class matPolyZonotope():
         # Make an expMat and id if not given
         if expMat is None and id is None:
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device)
-            self.id = np.arange(self.expMat.shape[1],dtype=int)
+            self.id = torch.arange(self.expMat.shape[1],dtype=torch.int64, device=Z.device)
 
         # Otherwise make sure expMat is right
         elif expMat is not None:
@@ -79,13 +78,13 @@ class matPolyZonotope():
                 
             # Make sure ID is right
             if id is not None:
-                self.id = np.asarray(id, dtype=int).flatten()
+                self.id = torch.as_tensor(id, dtype=torch.int64, device=Z.device).flatten()
             else:
-                self.id = np.arange(self.expMat.shape[1],dtype=int)
+                self.id = torch.arange(self.expMat.shape[1],dtype=torch.int64, device=Z.device)
                 
         # Otherwise ID is given, but not the expMat, so make identity
         else:
-            self.id = np.asarray(id, dtype=int).flatten()
+            self.id = torch.as_tensor(id, dtype=torch.int64, device=Z.device).flatten()
             assert len(self.id) == n_dep_gens, 'Number of dependent generators must match number of id\'s!'
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device)
         
@@ -96,6 +95,7 @@ class matPolyZonotope():
         else:
             self.Z = Z
         self.n_dep_gens = n_dep_gens
+        assert self.id.device == self.Z.device
 
     def compress(self, compression_level):
         # Remove zero generators
@@ -158,7 +158,7 @@ class matPolyZonotope():
     @property 
     def input_pairs(self):
         # id_sorted, order = torch.sort(self.id)
-        order = np.argsort(self.id)
+        order = torch.argsort(self.id)
         expMat_sorted = self.expMat[:,order] 
         # return self.Z, self.n_dep_gens, expMat_sorted, id_sorted
         return self.Z, self.n_dep_gens, expMat_sorted, self.id[order]
@@ -342,7 +342,7 @@ class matPolyZonotope():
         dim2 = dim1 if dim2 is not None else dim2
         Z = torch.zeros((1, dim1, dim2), dtype=dtype, device=device)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64, device=device)
         return zp.matPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
     
     @staticmethod
@@ -350,12 +350,12 @@ class matPolyZonotope():
         dim2 = dim1 if dim2 is not None else dim2
         Z = torch.zeros((1, dim1, dim2), dtype=dtype, device=device)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64, device=device)
         return zp.matPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
     
     @staticmethod
     def eye(dim, dtype=None, device=None):
         Z = torch.eye(dim, dtype=dtype, device=device).unsqueeze(0)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64)
         return zp.matPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)

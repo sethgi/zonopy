@@ -80,18 +80,17 @@ def removeRedundantExponents(ExpMat,G):
     ExpMatNew, Gnew = _removeRedundantExponentsScript(ExpMat, G.flatten(1, -1).unsqueeze(0))
     return ExpMatNew, Gnew.reshape((-1,)+N_shape)
 
-import numpy as np
 def mergeExpMatrix(id1, id2, expMat1, expMat2):
-    id1 = np.asarray(id1)
-    id2 = np.asarray(id2)
+    id1 = torch.as_tensor(id1, dtype=expMat1.dtype)
+    id2 = torch.as_tensor(id2, dtype=expMat1.dtype)
 
     # Handle trivial case where both are equal
-    if id1.shape == id2.shape and np.all(id1 == id2) and expMat1.shape[1] == expMat2.shape[1]:
+    if id1.shape == id2.shape and torch.all(id1 == id2) and expMat1.shape[1] == expMat2.shape[1]:
         return id1, expMat1, expMat2
 
     # Unique set of all IDs
-    id_combined = np.unique(np.concatenate((id1, id2)))
-    id_map = {val: i for i, val in enumerate(id_combined)}
+    id_combined = torch.unique(torch.concatenate((id1, id2)))
+    id_map = {int(val): i for i, val in enumerate(id_combined)}
 
     # Allocate new exp matrices
     expMat1_out = torch.zeros((expMat1.shape[0], len(id_combined)), dtype=expMat1.dtype, device=expMat1.device)
@@ -99,9 +98,9 @@ def mergeExpMatrix(id1, id2, expMat1, expMat2):
 
     # Fill rows using mapping
     for j, id_val in enumerate(id1):
-        expMat1_out[:, id_map[id_val]] = expMat1[:, j]
+        expMat1_out[:, id_map[int(id_val)]] = expMat1[:, j]
     for j, id_val in enumerate(id2):
-        expMat2_out[:, id_map[id_val]] = expMat2[:, j]
+        expMat2_out[:, id_map[int(id_val)]] = expMat2[:, j]
             
     return id_combined, expMat1_out, expMat2_out
 
@@ -121,21 +120,25 @@ def mergeExpMatrix_old(id1, id2, expMat1, expMat2):
     L1 = len(id1)
     L2 = len(id2)
 
-    import numpy as np
     # ID vectors are identical
     if L1 == L2 and all(id1==id2):
         id = id1
         return id, expMat1, expMat2
+    elif isinstance(id1, torch.Tensor):
+        ind2 = torch.zeros_like(id2, dtype=torch.long)
 
-    elif isinstance(id1, np.ndarray):
-        ind2 =np.zeros_like(id2)
-
-        Ind_rep = id2.reshape(-1,1) == id1
-        ind = np.any(Ind_rep,axis=1)
+        Ind_rep = (id2.reshape(-1, 1) == id1)  # [len(id2), len(id1)]
+        ind = Ind_rep.any(dim=1)               # which rows of id2 are in id1
         non_ind = ~ind
-        ind2[ind] = Ind_rep.nonzero()[1]
-        ind2[non_ind] = np.arange(non_ind.sum()) + len(id1)
-        id = np.hstack((id1,id2[non_ind]))
+
+        # For matches: take the column index of the first True in each row
+        ind2[ind] = Ind_rep[ind].nonzero(as_tuple=False)[:, 1]
+
+        # For non-matches: assign new indices after len(id1)
+        ind2[non_ind] = torch.arange(non_ind.sum(), device=id2.device) + id1.numel()
+
+        # Concatenate ids
+        id = torch.cat([id1, id2[non_ind]])
 
     # ID vectors not identical -> MERGE
     else:

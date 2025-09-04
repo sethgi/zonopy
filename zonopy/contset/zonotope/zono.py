@@ -471,7 +471,7 @@ class zonotope:
         idx = self.generators[:,dim] == 0
         assert sum(~idx) == 1, 'sliceable generator should be one for the dimension.'
         Z = torch.vstack((self.center,self.generators[~idx],self.generators[idx]))
-        return polyZonotope(Z,1,id=id)
+        return polyZonotope(Z,1,ids=id)
 
     def to_interval(self):
         '''

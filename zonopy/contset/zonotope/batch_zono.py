@@ -291,6 +291,9 @@ class batchZonotope:
         
         return <batchZonotope>
         '''
+        if isinstance(dim, int):
+            dim = [dim]
+            
         Z = self.Z[self.batch_idx_all+(slice(None),dim)]
         return batchZonotope(Z)
 
@@ -442,4 +445,46 @@ class batchZonotope:
         delta = torch.sum(abs(self.Z),self.batch_dim) - abs(c)
         leftLimit, rightLimit = c -delta, c + delta
         return interval(leftLimit,rightLimit)
+    
+    def norm(self, ord=2, dims=None, inv=False):
+        """
+        Compute a sound enclosure of ||x||_p for x in Z (or its reciprocal),
+        optionally after projecting onto selected coordinates.
 
+        Args:
+            ord: p in ||.||_p (passed to torch.linalg.vector_norm).
+            dims: iterable/int of coordinate indices to keep before taking the norm.
+                If None, use all coordinates.
+            inv: if True, compute 1/||.||_p instead of ||.||_p.
+
+        Returns:
+            batchZonotope of shape batch_shape + (2, 1), encoding the interval
+            [l, u] via center m=(l+u)/2 and generator r=(u-l)/2.
+        """
+        Z = self.project(dims) if dims is not None else self
+
+        c = Z.center
+        G = Z.generators
+
+        center_norm = torch.linalg.vector_norm(c, ord=ord, dim=-1)  # [...]
+        if G.numel() == 0:
+            generator_norm = torch.zeros_like(center_norm)
+        else:
+            generator_norm = torch.linalg.vector_norm(G, ord=ord, dim=-1).sum(dim=-1)
+
+        u = center_norm + generator_norm
+        l = torch.clamp(center_norm - generator_norm, min=0.0)
+
+        if inv:
+            # Guard against division by zero
+            if torch.any(l <= 0):
+                raise ValueError("Reciprocal norm undefined: interval touches zero.")
+            inv_low = 1.0 / u
+            inv_high = 1.0 / l
+            l, u = inv_low, inv_high
+
+        new_center = 0.5 * (l + u)
+        new_gen = 0.5 * (u - l)
+
+        Z1 = torch.stack((new_center, new_gen), dim=-1).unsqueeze(-1)  # [..., 2, 1]
+        return batchZonotope(Z1, dtype=self.dtype, device=self.device)
