@@ -105,13 +105,13 @@ class batchMatZonotope():
         '''
         if isinstance(other, torch.Tensor):
             z = self.Z@other
-            return batchZonotope(z)
+            return batchMatZonotope(z)
         
         elif isinstance(other,(zonotope,batchZonotope)):
             # Shim other to a batchMatPolyZonotope (and add an arbitrary batch dim to remove)
             shim_other = batchMatZonotope(other.Z.unsqueeze(-1).unsqueeze(0))
             Z = _matmul_genmzono_impl(self, shim_other)
-            return batchZonotope(Z.squeeze(-1).squeeze(0))
+            return batchMatZonotope(Z.squeeze(-1).squeeze(0))
         
         elif isinstance(other,(matZonotope,batchMatZonotope)):
             Z = _matmul_genmzono_impl(self, other)
@@ -183,3 +183,16 @@ class batchMatZonotope():
             return batchMatZonotope(ZRed)
         else:
             assert False, 'Invalid reduction option'
+            
+    def to_batchZono(self) -> "batchZonotope":
+        """
+        Reinterpret a batch matPolyZonotope with shape (..., dx, dy) as a batch
+        of dy-dimensional poly zonotopes with extra batch axis dx.
+
+        Returns:
+            zp.batchPolyZonotope with Z shape (..., dx, L, dy),
+            where L = n_dep_gens + n_indep_gens + 1.
+        """
+        # self.Z: (..., L, dx, dy) -> (..., dx, L, dy)
+        Z_out = self.Z.transpose(-3, -2)
+        return batchZonotope(Z_out)

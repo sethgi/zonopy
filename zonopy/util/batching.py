@@ -16,8 +16,8 @@ def stack(bpzlist, dim=0):
     assert len(bpzlist) > 0, "Expected at least 1 element input!"
 
     # Dispatch to specialized version for polyZonotopes if needed (these functions can be merged later)
-    promotion = np.array([isinstance(pz, zp.polyZonotope) for pz in bpzlist])
-    if np.all(promotion):
+    promotion = torch.tensor([isinstance(pz, zp.polyZonotope) for pz in bpzlist])
+    if torch.all(promotion):
         return zp.batchPolyZonotope.from_pzlist(bpzlist)
 
     # Promote any polynomial zonotopes to bpz's as needed
@@ -28,8 +28,6 @@ def stack(bpzlist, dim=0):
     bpzlist = [expand(pz, batch_shape) if promote else pz for pz, promote in zip(bpzlist, promotion)]
     
     # Check type (Should be fine after above)
-    # assert np.all([isinstance(bpz, zp.batchPolyZonotope) for bpz in bpzlist]), "Expected all elements to be of type batchPolyZonotope"
-    # Validate dimensions match
     n_bpz = len(bpzlist)
     dimension = bpzlist[0].dimension
     dtype = bpzlist[0].dtype
@@ -52,10 +50,13 @@ def stack(bpzlist, dim=0):
         n_grest[i] = bpz.n_indep_gens
     
     # Combine
-    all_ids = np.unique(np.concatenate(all_ids, axis=None))
-    all_dep_gens = np.sum(dep_gens)
-    dep_gens_idxs = np.cumsum([0]+dep_gens)
-    n_grest = np.max(n_grest)
+    all_ids = torch.unique(torch.cat([ids.flatten() for ids in all_ids], dim=0))
+    all_dep_gens = torch.tensor(dep_gens).sum()
+    dep_gens_idxs = torch.cat([
+        torch.zeros(1, dtype=torch.long, device=all_ids.device),
+        torch.cumsum(torch.tensor(dep_gens, dtype=torch.long, device=all_ids.device), dim=0)
+    ])
+    n_grest = torch.tensor(n_grest, device=all_ids.device).max()
     all_c = torch.stack(all_c)
 
     # Preallocate
@@ -67,7 +68,9 @@ def stack(bpzlist, dim=0):
     # expand remaining values
     for bpzid in range(n_bpz):
         # Expand ExpMat (replace any with nonzero to fix order bug!)
-        matches = np.nonzero(np.expand_dims(bpzlist[bpzid].id,1) == all_ids)[1]
+        matches = torch.nonzero(
+            bpzlist[bpzid].id.unsqueeze(1) == all_ids, as_tuple=False
+        )[:, 1]
         end_idx = last_expMat_idx + bpzlist[bpzid].expMat.shape[0]
         all_expMat[last_expMat_idx:end_idx,matches] = bpzlist[bpzid].expMat
         last_expMat_idx = end_idx

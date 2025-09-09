@@ -348,6 +348,34 @@ class interval:
             self.__inf[pos] = value
             self.__sup[pos] = value
 
+    def __pow__(self, exponent) -> "interval":
+        assert isinstance(exponent, int), "Only integer exponents are supported."
+
+        if exponent == 0:
+            ones = torch.ones_like(self.inf)
+            return interval(ones, ones)
+
+        if exponent < 0:
+            inv_inf = 1.0 / self.sup
+            inv_sup = 1.0 / self.inf
+            reciprocal = interval(inv_inf, inv_sup)
+            return reciprocal.__pow__(-exponent)
+
+        # exponent > 0
+        powers = torch.stack([
+            self.inf ** exponent,
+            self.sup ** exponent
+        ])
+
+        if self.inf < 0 and self.sup > 0 and exponent % 2 == 0:
+            # Even exponent across zero: min at zero
+            min_val = torch.zeros_like(self.inf)
+        else:
+            min_val = torch.min(powers, dim=0).values
+
+        max_val = torch.max(powers, dim=0).values
+        return interval(min_val, max_val)
+
     def __len__(self) -> int:
         """ Returns the length of the interval
 

@@ -6,7 +6,6 @@ Reference: Patrick Holme's implementation
 from zonopy.contset.polynomial_zonotope.utils import removeRedundantExponentsBatch
 import zonopy as zp
 import torch
-import numpy as np
 import zonopy.internal as zpi
 from ..gen_ops import (
     _matmul_genmpz_impl,
@@ -63,7 +62,7 @@ class batchMatPolyZonotope:
         # Make an expMat and id if not given
         if expMat is None and id is None:
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device) # if G is EMPTY_TENSOR, it will be EMPTY_TENSOR, size = (0,0)
-            self.id = np.arange(self.expMat.shape[1],dtype=int)
+            self.id = torch.arange(self.expMat.shape[1],type=torch.int64, device=Z.device)
 
         # Otherwise make sure expMat is right
         elif expMat is not None:
@@ -75,13 +74,13 @@ class batchMatPolyZonotope:
 
             # Make sure ID is right
             if id is not None:
-                self.id = np.asarray(id, dtype=int).flatten()
+                self.id = torch.asarray(id, dtype=torch.int64, device=Z.device).flatten()
             else:
-                self.id = np.arange(self.expMat.shape[1],dtype=int)
+                self.id = torch.arange(self.expMat.shape[1],dtype=torch.int64, device=Z.device)
         
         # Otherwise ID is given, but not the expMat, so make identity
         else:
-            self.id = np.asarray(id, dtype=int).flatten()
+            self.id = torch.asarray(id, type=torch.int64, device=Z.device).flatten()
             assert len(self.id) == n_dep_gens, 'Number of dependent generators must match number of id\'s!'
             self.expMat = torch.eye(n_dep_gens,dtype=torch.long,device=Z.device)
 
@@ -92,6 +91,7 @@ class batchMatPolyZonotope:
         else:
             self.Z = Z
         self.n_dep_gens = n_dep_gens
+        assert self.id.device == self.Z.device
 
     def compress(self, compression_level):
         # Remove zero generators
@@ -176,6 +176,75 @@ class batchMatPolyZonotope:
         # id = self.id.to(device=device)
         return batchMatPolyZonotope(Z,self.n_dep_gens,expMat,self.id,copy_Z=False)
         
+    def center_slice_all_dep(self, val_slc: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the dependent part at specific indeterminate values and return
+        the resulting center matrix for each batch element.
+
+        Args:
+            val_slc: tensor with the values of the indeterminates.
+                    Shape: [..., K]
+                    If K == len(self.id), values are assumed ordered like self.id.
+                    Otherwise K is treated as a dense ID domain and we gather by raw IDs.
+
+        Returns:
+            Tensor of shape [..., dx, dy] with the sliced center.
+        """
+        # Ensure dtype/device compatibility
+        if not isinstance(val_slc, torch.Tensor):
+            val_slc = torch.as_tensor(val_slc, dtype=self.dtype, device=self.device)
+        else:
+            val_slc = val_slc.to(dtype=self.dtype, device=self.device)
+
+        device = self.device
+        exp_dtype = self.expMat.dtype
+
+        tgt_ids = torch.as_tensor(self.id, device=device, dtype=torch.long)  # (n_ids,)
+        n_ids = tgt_ids.numel()
+        src_width = val_slc.shape[-1]
+
+        # Compile-safe alignment:
+        # - If already compact/aligned: identity gather.
+        # - Else: treat val_slc as dense-by-ID and gather by raw IDs with masking.
+        if src_width == n_ids:
+            gather_idx = torch.arange(n_ids, device=device)
+            gather_idx = gather_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx)  # (..., n_ids)
+        else:
+            idx = tgt_ids
+            mask = (idx >= 0) & (idx < src_width)
+            safe_idx = idx.clamp_min(0).clamp_max(src_width - 1)
+            gather_idx = safe_idx.expand(*val_slc.shape[:-1], n_ids)
+            vals = torch.gather(val_slc, dim=-1, index=gather_idx)
+            vals = vals * mask.to(vals.dtype)  # zero out missing IDs
+
+        # Broadcast to [..., 1, n_ids] and compute monomial coefficients
+        v = vals.to(exp_dtype)[..., None, :]
+        alpha_coeffs = torch.prod(v ** self.expMat, dim=-1)  # (..., n_dep_gens)
+
+        # Weighted sum over dependent generators to get offset [..., dx, dy]
+        offset = torch.einsum('...g,...gxy->...xy', alpha_coeffs, self.G)
+
+        return self.C + offset
+
+    def slice_all_dep(self, val_slc: torch.Tensor) -> "zp.batchMatZonotope":
+        """
+        Slice *all* dependent indeterminates to the provided values and return
+        a batchMatZonotope with the same independent generators.
+
+        Args:
+            val_slc: tensor with the values of the indeterminates.
+                    Shape: [..., n_ids] (last axis corresponds to self.id order)
+
+        Returns:
+            zp.batchMatZonotope with center = center_slice_all_dep(val_slc),
+            and generators = self.Grest.
+        """
+        C_sliced = self.center_slice_all_dep(val_slc)  # [..., dx, dy]
+        # Stack center and unchanged independent generators along generator axis (-3)
+        Z = torch.cat((C_sliced.unsqueeze(-3), self.Grest), dim=-3)
+        return zp.batchMatZonotope(Z)
+
     def cpu(self):
         Z = self.Z.cpu()
         expMat = self.expMat.cpu()
@@ -208,7 +277,7 @@ class batchMatPolyZonotope:
             # Shim other to a batchMatPolyZonotope (and add an arbitrary batch dim to remove)
             shim_other = zp.batchMatPolyZonotope(other.Z.unsqueeze(-1).unsqueeze(0),other.n_dep_gens,other.expMat,other.id,copy_Z=False)
             Z, n_dep_gens, expMat, id = _matmul_genmpz_impl(self, shim_other)
-            return zp.batchPolyZonotope(Z.squeeze(-1).squeeze(0), n_dep_gens, expMat, id).compress(2)
+            return zp.batchPolyZonotope(Z.squeeze(-1).squeeze(0), n_dep_gens, expMat, id)#.compress(2)
 
         elif isinstance(other, (batchMatPolyZonotope, zp.matPolyZonotope)):
             args = _matmul_genmpz_impl(self, other)
@@ -217,6 +286,20 @@ class batchMatPolyZonotope:
         else:
             return NotImplemented
 
+    def to_batchPolyZono(self) -> "zp.batchPolyZonotope":
+        """
+        Reinterpret a batch matPolyZonotope with shape (..., dx, dy) as a batch
+        of dy-dimensional poly zonotopes with extra batch axis dx.
+
+        Returns:
+            zp.batchPolyZonotope with Z shape (..., dx, L, dy),
+            where L = n_dep_gens + n_indep_gens + 1.
+        """
+        # self.Z: (..., L, dx, dy) -> (..., dx, L, dy)
+        Z_out = self.Z.transpose(-3, -2)
+        return zp.batchPolyZonotope(Z_out, self.n_dep_gens, self.expMat, self.id, copy_Z=False)
+
+        
     def __rmatmul__(self,other):
         '''
         Overloaded '@' operator for the multiplication of a __ with a matPolyZonotope
@@ -288,7 +371,7 @@ class batchMatPolyZonotope:
     def from_mpzlist(mpzlist):
         assert len(mpzlist) > 0, "Expected at least 1 element input!"
         # Check type
-        assert np.all([isinstance(mpz, zp.matPolyZonotope) for mpz in mpzlist]), "Expected all elements to be of type matPolyZonotope"
+        assert torch.all([isinstance(mpz, zp.matPolyZonotope) for mpz in mpzlist]), "Expected all elements to be of type matPolyZonotope"
         # Validate dimensions match
         n_mpz = len(mpzlist)
         shape = mpzlist[0].shape
@@ -308,12 +391,14 @@ class batchMatPolyZonotope:
             n_grest[i] = mpz.n_indep_gens
         
         # Combine
-        all_ids = np.unique(np.concatenate(all_ids, axis=None))
-        all_dep_gens = np.sum(dep_gens)
-        dep_gens_idxs = np.cumsum([0]+dep_gens)
-        n_grest = np.max(n_grest)
+        all_ids = torch.unique(torch.cat([ids.flatten() for ids in all_ids], dim=0))
+        all_dep_gens = torch.tensor(dep_gens, dtype=torch.long, device=all_c[0].device).sum()
+        dep_gens_idxs = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=all_c[0].device),
+            torch.cumsum(torch.tensor(dep_gens, dtype=torch.long, device=all_c[0].device), dim=0)
+        ])
+        n_grest = torch.tensor(n_grest, dtype=torch.long, device=all_c[0].device).max()
         all_c = torch.stack(all_c)
-
         # Preallocate
         all_G = torch.zeros((n_mpz, all_dep_gens) + shape, dtype=dtype, device=device)
         all_grest = torch.zeros((n_mpz, n_grest) + shape, dtype=dtype, device=device)
@@ -323,7 +408,9 @@ class batchMatPolyZonotope:
         # expand remaining values
         for mpzid in range(n_mpz):
             # Expand ExpMat (replace any with nonzero to fix order bug!)
-            matches = np.nonzero(np.expand_dims(mpzlist[mpzid].id,1) == all_ids)[1]
+            matches = torch.nonzero(
+                mpzlist[mpzid].id.unsqueeze(1) == all_ids, as_tuple=False
+            )[:, 1]
             end_idx = last_expMat_idx + mpzlist[mpzid].expMat.shape[0]
             all_expMat[last_expMat_idx:end_idx,matches] = mpzlist[mpzid].expMat
             last_expMat_idx = end_idx
@@ -343,7 +430,10 @@ class batchMatPolyZonotope:
     @staticmethod
     def combine_bmpz(bmpzlist, idxs):
         # Takes a list of bpz and respective idxs for them and combines them appropriately
-        out_list = np.empty(np.concatenate(idxs, axis=None).max()+1, dtype=object)
+        out_list = torch.empty(
+            torch.cat([i.flatten() for i in idxs]).max().item() + 1,
+            dtype=torch.object
+        )
         for i,locations in enumerate(idxs):
             out_list[locations] = [bmpzlist[i][j] for j in range(len(locations))]
         return zp.batchMatPolyZonotope.from_pzlist(out_list)
@@ -355,7 +445,7 @@ class batchMatPolyZonotope:
             batch_size = (batch_size,)
         Z = torch.zeros((1, dim1, dim2), dtype=dtype, device=device).expand(*batch_size, -1, -1, -1)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64, device=device)
         return zp.batchMatPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
     
     @staticmethod
@@ -365,7 +455,7 @@ class batchMatPolyZonotope:
             batch_size = (batch_size,)
         Z = torch.zeros((1, dim1, dim2), dtype=dtype, device=device).expand(*batch_size, -1, -1, -1)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64, device=device)
         return zp.batchMatPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
     
     @staticmethod
@@ -374,6 +464,6 @@ class batchMatPolyZonotope:
             batch_size = (batch_size,)
         Z = torch.eye(dim, dtype=dtype, device=device).unsqueeze(0).expand(*batch_size, -1, -1, -1)
         expMat = torch.empty((0,0),dtype=torch.int64, device=device)
-        id = np.empty(0,dtype=np.int64)
+        id = torch.empty(0,dtype=torch.int64)
         return zp.batchMatPolyZonotope(Z, 0, expMat=expMat, id=id, copy_Z=False)
     

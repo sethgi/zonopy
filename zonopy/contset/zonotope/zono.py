@@ -276,6 +276,8 @@ class zonotope:
         
         return <zonotope>
         '''
+        if isinstance(dim, int):
+            dim = [dim]
         Z = self.Z[:,dim]
         return zonotope(Z)
 
@@ -383,6 +385,7 @@ class zonotope:
         PA = torch.vstack((C,-C))
         Pb = torch.hstack((d+deltaD,-d+deltaD))
         return PA, Pb
+    
 
     def deleteZerosGenerators(self,eps=0):
         '''
@@ -415,7 +418,7 @@ class zonotope:
         V = V.unsqueeze(0)        
         return torch.cat([V[:,s] for s in K.simplices])
  
-    def plot(self, ax,facecolor='none',edgecolor='green',linewidth=.2,dim=[0,1]):
+    def plot(self, ax,facecolor='none',edgecolor='green',linewidth=.2,dim=[0,1], label=None, alpha=.4):
         '''
         plot 2 dimensional projection of a zonotope
         self: <zonotope>
@@ -434,7 +437,9 @@ class zonotope:
         z = self.project(dim)
         p = z.polygon().cpu()
 
-        return ax.add_patch(patches.Polygon(p,alpha=.5,edgecolor=edgecolor,facecolor=facecolor,linewidth=linewidth))
+        return ax.add_patch(patches.Polygon(p,edgecolor=edgecolor,
+                                            facecolor=facecolor,linewidth=linewidth,
+                                            label=label, alpha=alpha))
 
     def reduce(self,order,option='girard'):
         if option == 'girard':
@@ -466,7 +471,7 @@ class zonotope:
         idx = self.generators[:,dim] == 0
         assert sum(~idx) == 1, 'sliceable generator should be one for the dimension.'
         Z = torch.vstack((self.center,self.generators[~idx],self.generators[idx]))
-        return polyZonotope(Z,1,id=id)
+        return polyZonotope(Z,1,ids=id)
 
     def to_interval(self):
         '''
@@ -479,3 +484,16 @@ class zonotope:
         return interval(leftLimit,rightLimit)
 
 
+    def l2_norm(self) -> interval:        
+        intv = self.to_interval()
+        lb = intv.inf
+        ub = intv.sup
+
+        # Compute lower and upper bounds of squared norm component-wise
+        lb_sq = torch.minimum(lb**2, ub**2)
+        ub_sq = torch.maximum(lb**2, ub**2)
+
+        lower_bound = torch.sqrt(torch.sum(lb_sq))
+        upper_bound = torch.sqrt(torch.sum(ub_sq))
+
+        return interval(lower_bound, upper_bound, device=self.device, dtype=self.dtype)

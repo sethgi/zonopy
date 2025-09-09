@@ -18,23 +18,43 @@ if TYPE_CHECKING:
     from .zonotope.mat_zono import matZonotope as MZonoType
     from .zonotope.batch_mat_zono import batchMatZonotope as BMZonoType
 
+def _expand_to_batch_right(x: torch.Tensor, target_batch: tuple, feature_ndim: int) -> torch.Tensor:
+    """
+    Make `x` broadcastable to `target_batch + x.shape[-feature_ndim:]` by
+    inserting 1s just before the feature dims (right-padding the batch).
+    """
+    b = x.shape[:-feature_ndim]
+    need = len(target_batch) - len(b)
+    if need > 0:
+        x = x.reshape(b + (1,) * need + x.shape[-feature_ndim:])
+    return x.expand(target_batch + x.shape[-feature_ndim:])
 
-# exact Plus
-def _add_genzono_impl(
-        zono1: Union[ZonoType, BZonoType],
-        zono2: Union[ZonoType, BZonoType],
-        batch_shape: Tuple = ()
-        ) -> torch.Tensor:
-    assert zono1.dimension == zono2.dimension, \
-        f'zonotope dimension does not match: {zono1.dimension} and {zono2.dimension}.'
+def _add_genzono_impl(z1, z2, batch_shape: tuple = ()):
+    assert z1.dimension == z2.dimension
 
-    expand_shape = batch_shape+(-1, -1)
-    Zlist = (
-        (zono1.center+zono2.center).unsqueeze(-2),
-        zono1.generators.expand(expand_shape),
-        zono2.generators.expand(expand_shape),
-    )
-    Z = torch.cat(Zlist, dim=-2)
+    # Decide the target batch shape (right-padded)
+    b1 = z1.center.shape[:-1]
+    b2 = z2.center.shape[:-1]
+    nd = max(len(b1), len(b2))
+    pad_right = lambda b: b + (1,) * (nd - len(b))
+    b1p, b2p = pad_right(b1), pad_right(b2)
+
+    # Validate broadcastability & compute target
+    for a, b in zip(b1p, b2p):
+        if not (a == b or a == 1 or b == 1):
+            raise ValueError(f"Batch shapes {b1} and {b2} cannot be broadcast")
+    target_batch = tuple(max(a, b) for a, b in zip(b1p, b2p))
+
+    # Centers: feature_ndim = 1
+    c1 = _expand_to_batch_right(z1.center, target_batch, feature_ndim=1)
+    c2 = _expand_to_batch_right(z2.center, target_batch, feature_ndim=1)
+    c_sum = c1 + c2  # [..., d]
+
+    # Generators: feature_ndim = 2  (generator_count, d)
+    g1 = _expand_to_batch_right(z1.generators, target_batch, feature_ndim=2)
+    g2 = _expand_to_batch_right(z2.generators, target_batch, feature_ndim=2)
+
+    Z = torch.cat((c_sum.unsqueeze(-2), g1, g2), dim=-2)  # [..., 1+g1+g2, d]
     return Z
 
 
@@ -63,7 +83,8 @@ def _mul_genzono_num_impl(
     if batch_shape is not None \
             and isinstance(num, torch.Tensor) \
             and num.shape[:len(batch_shape)] == batch_shape:
-        num = num.unsqueeze(1)
+        for _ in range(len(zono.Z.shape) - len(num.shape[1:]) - len(batch_shape)):
+            num = num[..., None]
     Z = zono.Z * num
     return Z
 
@@ -129,12 +150,14 @@ def __mul_Z_tensormerge(Z1: torch.Tensor, Z2: torch.Tensor, z1_ndep: int, z2_nde
     Z = torch.cat((z1,z2,z3,z4),dim=-2)
     return Z
 
+import time
 
 def _mul_genpz_impl(
         pz1: Union[PZType, BPZType],
         pz2: Union[PZType, BPZType]
         ) -> Tuple[torch.Tensor, int, torch.Tensor, np.ndarray]:
-    assert pz1.dimension == pz2.dimension, 'Both polynomial zonotope must have same dimension!'
+    assert (pz1.dimension == pz2.dimension) or (pz1.dimension == 1) or (pz2.dimension == 1), \
+        "polyZonotope dims must match, unless one is 1 (scalar)."
 
     # Generate the expMat for the overlapping parts
     id, expMat1, expMat2 = mergeExpMatrix(pz1.id, pz2.id, pz1.expMat, pz2.expMat)
@@ -143,9 +166,37 @@ def _mul_genpz_impl(
     expMat = torch.vstack((expMat1,expMat2,first + second))
     n_dep_gens = (pz1.n_dep_gens+1) * (pz2.n_dep_gens+1)-1 
     
-    # If batch_dim are not equal, this fails!
-    # Generate new Z matrix
-    Z = __mul_Z_tensormerge(pz1.Z, pz2.Z, pz1.n_dep_gens, pz2.n_dep_gens)
+    # ---- Broadcast Z tensors over batch dims and spatial dim ----
+    # Shapes: Z1: [B..., R1, d1], Z2: [B..., R2, d2]
+    Z1, Z2 = pz1.Z, pz2.Z
+    d1, d2 = Z1.shape[-1], Z2.shape[-1]
+    R1, R2 = Z1.shape[-2], Z2.shape[-2]
+
+    # Common batch shape
+    bshape1 = Z1.shape[:-2]
+    bshape2 = Z2.shape[:-2]
+    target_bshape = torch.broadcast_shapes(bshape1, bshape2)
+
+
+    def _expand_to(t: torch.Tensor, bshape: Tuple[int, ...], r: int, d: int,
+                   target_bshape: Tuple[int, ...], target_d: int) -> torch.Tensor:
+        # Expand batch dims
+        if bshape != target_bshape:
+            t = t.expand(*target_bshape, r, d)
+        # Expand spatial dim if scalar
+        if d == 1 and target_d > 1:
+            t = t.expand(*t.shape[:-1], target_d)
+        return t
+
+    d_out = d1 if d2 == 1 else d2 if d1 == 1 else d1  # if both >1, they are equal by assert
+
+    Z1b = _expand_to(Z1, bshape1, R1, d1, target_bshape, d_out)
+    Z2b = _expand_to(Z2, bshape2, R2, d2, target_bshape, d_out)
+
+    # ---- Fuse numeric blocks (reuses your existing kernel) ----
+    # This expects matched batch and spatial dims now.
+    Z = __mul_Z_tensormerge(Z1b, Z2b, pz1.n_dep_gens, pz2.n_dep_gens)
+
     return Z, n_dep_gens, expMat, id
 
 
