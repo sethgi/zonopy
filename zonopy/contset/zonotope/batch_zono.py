@@ -16,27 +16,21 @@ from ..gen_ops import (
     )
 
 class batchZonotope:
-    r''' Batched 1D zonotope class
-
-    Batched form of the :class:`zonotope` class.
-    This class is used to represent a batch of zonotopes over arbitrary batch dimensions,
-    where each zonotope in the batch is expanded to have the same number of generators.
-
-    This results in a :math:`\mathbf{Z}` tensor of shape :math:`B_1 \times B_2 \times \ldots \times (N+1) \times d`.
-
-    Refer to the :class:`zonotope` class for more details on zonotopes.
     '''
-    def __init__(self, Z, dtype=None, device=None):
-        r""" Initialize a batch zonotope
+    b-zono: <batchZonotope>
 
-        Args:
-            Z (torch.Tensor): The :math:`\mathbf{Z}` tensor of shape :math:`B_1 \times B_2 \times \ldots \times (N+1) \times d`.
-            dtype (torch.dtype, optional): The data type of the batch zonotope. If None, the data type is inferred. Defaults to None.
-            device (str, optional): The device of the batch zonotope. If None, the device is inferred. Defaults to None.
-        
-        Raises:
-            AssertionError: If the rank of Z is less than 3.
-        """
+    Z: <torch.Tensor> batch of center vector and generator matrix Z = [[C],[G]]
+    , shape [B1, B2, .. , Bb, N+1, nx]
+    center: <torch.Tensor> batch of center vector
+    , shape [B1, B2, .. , Bb, nx] 
+    generators: <torch.Tensor> batch of generator matrix
+    , shape [B1, B2, .. , Bb, N, nx]
+    
+    Eq.
+    G = [[g1],[g2],...,[gN]]
+    b-zono = {c + a1*g1 + a2*g2 + ... + aN*gN | coeff. a1,a2,...,aN \in [-1,1] }
+    '''
+    def __init__(self,Z, dtype=None, device=None):
         ################ may not need these for speed ################ 
         # Make sure Z is a tensor
         if not isinstance(Z, torch.Tensor) and dtype is None:
@@ -48,7 +42,6 @@ class batchZonotope:
         self.Z = Z
         self.batch_dim = len(Z.shape) - 2
         self.batch_idx_all = tuple([slice(None) for _ in range(self.batch_dim)])
-
     def __getitem__(self,idx):
         Z = self.Z[idx]
         if len(Z.shape) > 2:
@@ -238,51 +231,65 @@ class batchZonotope:
     def __len__(self):
         return self.Z.shape[0]
 
-    def slice(self,slice_dim,slice_pt):
+    def slice(self, slice_dim, slice_pt, return_grads = False):
         '''
-        slice zonotope on specified point in a certain dimension
-        self: <zonotope>
-        slice_dim: <torch.Tensor> or <list> or <int>
-        , shape  []
-        slice_pt: <torch.Tensor> or <list> or <float> or <int>
-        , shape  []
-        return <zonotope>
+        Slice zonotope on specified point in a given dimension and return gradient.
+        Returns:
+            newzono: batchZonotope after slicing
+            dNewCenter_dSlicePt: gradient of the new center with respect to slice_pt
         '''
         if isinstance(slice_dim, list):
-            slice_dim = torch.tensor(slice_dim,dtype=torch.long,device=self.device)
-        elif isinstance(slice_dim, int) or (isinstance(slice_dim, torch.Tensor) and len(slice_dim.shape)==0):
-            slice_dim = torch.tensor([slice_dim],dtype=torch.long,device=self.device)
+            slice_dim = torch.tensor(slice_dim, dtype=torch.long, device=self.device)
+        elif isinstance(slice_dim, int) or (isinstance(slice_dim, torch.Tensor) and len(slice_dim.shape) == 0):
+            slice_dim = torch.tensor([slice_dim], dtype=torch.long, device=self.device)
 
         if isinstance(slice_pt, list):
-            slice_pt = torch.tensor(slice_pt,dtype=self.dtype,device=self.device)
-        elif isinstance(slice_pt, int) or isinstance(slice_pt, float) or (isinstance(slice_pt, torch.Tensor) and len(slice_pt.shape)==0):
-            slice_pt = torch.tensor([slice_pt],dtype=self.dtype,device=self.device)
+            slice_pt = torch.tensor(slice_pt, dtype=self.dtype, device=self.device)
+        elif isinstance(slice_pt, int) or isinstance(slice_pt, float) or (isinstance(slice_pt, torch.Tensor) and len(slice_pt.shape) == 0):
+            slice_pt = torch.tensor([slice_pt], dtype=self.dtype, device=self.device)
 
         assert isinstance(slice_dim, torch.Tensor) and isinstance(slice_pt, torch.Tensor), 'Invalid type of input'
-        assert len(slice_dim.shape) ==1, 'slicing dimension should be 1-dim component.'
-        #assert slice_pt.shape[:-1] ==self.batch_shape, 'slicing point should be (batch+1)-dim component.'
-        assert len(slice_dim) == slice_pt.shape[-1], f'The number of slicing dimension ({len(slice_dim)}) and the number of slicing point ({slice_pt.shape[-1]}) should be the same.'
+        assert len(slice_dim.shape) == 1, 'slicing dimension should be 1-dim component.'
+        assert len(slice_dim) == slice_pt.shape[-1], (
+            f'The number of slicing dimensions ({len(slice_dim)}) and the number of slicing points '
+            f'({slice_pt.shape[-1]}) should be the same.'
+        )
 
         N = len(slice_dim)
         slice_dim, ind = torch.sort(slice_dim)
-        slice_pt = slice_pt[(slice(None),)*(len(slice_pt.shape)-1)+(ind,)]
+        slice_pt = slice_pt[(slice(None),) * (len(slice_pt.shape) - 1) + (ind,)]
 
         c = self.center
         G = self.generators
-        G_dim = G[self.batch_idx_all+(slice(None),slice_dim)]
+        G_dim = G[self.batch_idx_all + (slice(None), slice_dim)]
         non_zero_idx = G_dim != 0
-        assert torch.all(torch.sum(non_zero_idx,-2)==1), 'There should be one generator for each slice index.'
-        slice_idx = non_zero_idx.transpose(-2,-1).nonzero()
+        assert torch.all(torch.sum(non_zero_idx, -2) == 1), 'There should be one generator for each slice index.'
+        slice_idx = non_zero_idx.transpose(-2, -1).nonzero()
 
+        slice_c = c[self.batch_idx_all + (slice_dim,)]
+        ind = tuple(slice_idx[:, :-2].T)
+        slice_g = G_dim[ind + (slice_idx[:, -1], slice_idx[:, -2])].reshape(self.batch_shape + (N,))
+        slice_lambda = (slice_pt - slice_c) / slice_g
+        assert not (abs(slice_lambda) > 1).any(), 'Slice point is outside bounds of reach set'
 
-        #slice_idx = torch.any(non_zero_idx,-1)        
-        slice_c = c[self.batch_idx_all+(slice_dim,)]
-        ind = tuple(slice_idx[:,:-2].T)
-        slice_g = G_dim[ind+(slice_idx[:,-1],slice_idx[:,-2])].reshape(self.batch_shape+(N,))
-        slice_lambda = (slice_pt-slice_c)/slice_g
-        assert not (abs(slice_lambda)>1).any(), 'slice point is ouside bounds of reach set, and therefore is not verified'        
-        Z = torch.cat((c.unsqueeze(-2) + slice_lambda.unsqueeze(-2)@G[ind+(slice_idx[:,-1],)].reshape(self.batch_shape+(N,self.dimension)),G[~non_zero_idx.any(-1)].reshape(self.batch_shape+(-1,self.dimension))),-2)
-        return batchZonotope(Z)
+        # Compute new center and its gradient
+        G_slice = G[ind + (slice_idx[:, -1],)].reshape(self.batch_shape + (N, self.dimension))
+        newc = c.unsqueeze(-2) + slice_lambda.unsqueeze(-2) @ G_slice
+        newc = newc.squeeze(-2)
+
+        # Form new zonotope by removing the sliced generators
+        remaining = ~non_zero_idx.any(-1)
+        newG = G[remaining].reshape(self.batch_shape + (-1, self.dimension))
+        Z = torch.cat((newc.unsqueeze(-2), newG), -2)
+        output_zono = batchZonotope(Z)
+
+        if return_grads:
+            dNewCenter_dSlicePt = G_slice.transpose(-2, -1) / slice_g.unsqueeze(-2)
+            dNewGenerators_dSlicePt = torch.zeros(newG.shape + (slice_pt.shape[-1],), dtype=self.dtype, device=self.device)
+            return output_zono, dNewCenter_dSlicePt, dNewGenerators_dSlicePt
+        
+        return output_zono
+
     def project(self,dim=[0,1]):
         '''
         The projection of a batch zonotope onto the specified dimensions
@@ -291,9 +298,6 @@ class batchZonotope:
         
         return <batchZonotope>
         '''
-        if isinstance(dim, int):
-            dim = [dim]
-            
         Z = self.Z[self.batch_idx_all+(slice(None),dim)]
         return batchZonotope(Z)
 
@@ -445,46 +449,3 @@ class batchZonotope:
         delta = torch.sum(abs(self.Z),self.batch_dim) - abs(c)
         leftLimit, rightLimit = c -delta, c + delta
         return interval(leftLimit,rightLimit)
-    
-    def norm(self, ord=2, dims=None, inv=False):
-        """
-        Compute a sound enclosure of ||x||_p for x in Z (or its reciprocal),
-        optionally after projecting onto selected coordinates.
-
-        Args:
-            ord: p in ||.||_p (passed to torch.linalg.vector_norm).
-            dims: iterable/int of coordinate indices to keep before taking the norm.
-                If None, use all coordinates.
-            inv: if True, compute 1/||.||_p instead of ||.||_p.
-
-        Returns:
-            batchZonotope of shape batch_shape + (2, 1), encoding the interval
-            [l, u] via center m=(l+u)/2 and generator r=(u-l)/2.
-        """
-        Z = self.project(dims) if dims is not None else self
-
-        c = Z.center
-        G = Z.generators
-
-        center_norm = torch.linalg.vector_norm(c, ord=ord, dim=-1)  # [...]
-        if G.numel() == 0:
-            generator_norm = torch.zeros_like(center_norm)
-        else:
-            generator_norm = torch.linalg.vector_norm(G, ord=ord, dim=-1).sum(dim=-1)
-
-        u = center_norm + generator_norm
-        l = torch.clamp(center_norm - generator_norm, min=0.0)
-
-        if inv:
-            # Guard against division by zero
-            if torch.any(l <= 0):
-                raise ValueError("Reciprocal norm undefined: interval touches zero.")
-            inv_low = 1.0 / u
-            inv_high = 1.0 / l
-            l, u = inv_low, inv_high
-
-        new_center = 0.5 * (l + u)
-        new_gen = 0.5 * (u - l)
-
-        Z1 = torch.stack((new_center, new_gen), dim=-1).unsqueeze(-1)  # [..., 2, 1]
-        return batchZonotope(Z1, dtype=self.dtype, device=self.device)
